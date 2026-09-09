@@ -5,6 +5,8 @@ capabilities live on the domain-specific in-process servers and are reachable th
 MCPBridge REST control plane only after policy + human approval.
 """
 
+from typing import Any
+
 from mcp.server import MCPServer
 
 from src.mcpbridge import systems
@@ -20,17 +22,17 @@ def build_public_mcp_server() -> MCPServer:
     )
 
     @mcp.tool()
-    def get_incident(incident_id: str) -> dict:
+    def get_incident(incident_id: str) -> dict[str, Any]:
         """Read a synthetic ITSM incident."""
         return systems.get_incident(incident_id)
 
     @mcp.tool()
-    def get_repository_status(repo: str) -> dict:
+    def get_repository_status(repo: str) -> dict[str, Any]:
         """Read synthetic repository health."""
         return systems.get_repository_status(repo)
 
     @mcp.tool()
-    def compare_suppliers(left: str, right: str) -> dict:
+    def compare_suppliers(left: str, right: str) -> dict[str, Any]:
         """Compare two synthetic supplier profiles."""
         return systems.compare_suppliers(left, right)
 
