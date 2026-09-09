@@ -30,3 +30,88 @@ jobs:
         run: npm run test:web
       - name: Production build
         run: npm run build
+      - name: Production server end-to-end smoke
+        run: |
+          npm start -- --hostname 127.0.0.1 --port 3000 > /tmp/mcpbridge-web.log 2>&1 &
+          SERVER_PID=$!
+          trap 'kill $SERVER_PID 2>/dev/null || true; cat /tmp/mcpbridge-web.log' EXIT
+          node - <<'JS'
+          const base = 'http://127.0.0.1:3000';
+          const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+          async function json(path, init) {
+            const response = await fetch(base + path, init);
+            const body = await response.json();
+            if (!response.ok) throw new Error(`${path} failed (${response.status}): ${JSON.stringify(body)}`);
+            return {response, body};
+          }
+
+          for (let attempt = 0; attempt < 40; attempt++) {
+            try {
+              const response = await fetch(base + '/api/health');
+              if (response.ok) break;
+            } catch {}
+            if (attempt === 39) throw new Error('Next.js production server did not become ready');
+            await sleep(250);
+          }
+
+          const root = await fetch(base + '/');
+          const html = await root.text();
+          if (!root.ok || !html.includes('MCPBridge')) throw new Error('portfolio root page smoke failed');
+
+          const health = await json('/api/health');
+          if (health.body.runtime_mode !== 'deterministic-public-demo') throw new Error('unexpected runtime mode');
+          if (health.body.protocol_target !== '2026-07-28') throw new Error('unexpected protocol target');
+
+          const catalog = await json('/api/catalog');
+          const serverNames = Object.keys(catalog.body.servers || {}).sort();
+          if (serverNames.join(',') !== 'business,github,itsm') throw new Error('catalog server set mismatch');
+
+          const read = await json('/api/execute', {
+            method: 'POST',
+            headers: {'content-type': 'application/json'},
+            body: JSON.stringify({
+              role: 'viewer',
+              server: 'itsm',
+              tool: 'get_incident',
+              arguments: {incident_id: 'INC-428'},
+            }),
+          });
+          if (read.body.status !== 'completed' || read.body.result?.id !== 'INC-428') {
+            throw new Error('web read execution smoke failed');
+          }
+
+          const proposal = await json('/api/execute', {
+            method: 'POST',
+            headers: {'content-type': 'application/json'},
+            body: JSON.stringify({
+              role: 'operator',
+              server: 'itsm',
+              tool: 'create_change_request',
+              arguments: {
+                service: 'payments-api',
+                summary: 'Web production smoke',
+                risk: 'low',
+                implementation_window: 'approved test window',
+              },
+            }),
+          });
+          if (proposal.body.status !== 'approval_required' || !proposal.body.approval_token) {
+            throw new Error('web approval proposal smoke failed');
+          }
+
+          const approved = await json('/api/approve', {
+            method: 'POST',
+            headers: {'content-type': 'application/json'},
+            body: JSON.stringify({
+              role: 'approver',
+              approval_token: proposal.body.approval_token,
+              decision: 'approve',
+            }),
+          });
+          if (approved.body.status !== 'completed' || approved.body.result?.status !== 'created') {
+            throw new Error('web approval execution smoke failed');
+          }
+
+          console.log('Next.js production end-to-end smoke passed');
+          JS

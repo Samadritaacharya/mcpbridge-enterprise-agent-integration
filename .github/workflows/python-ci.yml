@@ -45,6 +45,7 @@ jobs:
           import time
           import urllib.request
           from mcp import Client
+          from mcp.types import TextResourceContents
 
           BASE = "http://127.0.0.1:8765"
           for _ in range(40):
@@ -65,20 +66,48 @@ jobs:
                   assert {"get_incident", "get_repository_status", "compare_suppliers"}.issubset(names)
                   assert "create_change_request" not in names
                   assert "create_github_issue" not in names
+                  assert "create_incident" not in names
                   assert str(client.protocol_version) == "2026-07-28"
 
-                  result = await client.call_tool("get_incident", {"incident_id": "INC-428"})
-                  assert result.is_error is False
-                  assert result.structured_content is not None
-                  assert result.structured_content["id"] == "INC-428"
+                  incident = await client.call_tool("get_incident", {"incident_id": "INC-428"})
+                  assert incident.is_error is False
+                  assert incident.structured_content is not None
+                  assert incident.structured_content["id"] == "INC-428"
+
+                  repository = await client.call_tool(
+                      "get_repository_status", {"repo": "payments-api"}
+                  )
+                  assert repository.is_error is False
+                  assert repository.structured_content is not None
+                  assert repository.structured_content["name"] == "payments-api"
+                  assert repository.structured_content["ci"] == "degraded"
+
+                  comparison = await client.call_tool(
+                      "compare_suppliers", {"left": "SUP-ALPHA", "right": "SUP-BETA"}
+                  )
+                  assert comparison.is_error is False
+                  assert comparison.structured_content is not None
+                  assert comparison.structured_content["left"]["id"] == "SUP-ALPHA"
+                  assert comparison.structured_content["right"]["id"] == "SUP-BETA"
 
                   resources = await client.list_resource_templates()
-                  assert any(item.uri_template == "incident://{incident_id}" for item in resources.resource_templates)
+                  assert any(
+                      item.uri_template == "incident://{incident_id}"
+                      for item in resources.resource_templates
+                  )
+                  resource = await client.read_resource("incident://INC-428")
+                  assert isinstance(resource.contents[0], TextResourceContents)
+                  assert "INC-428" in resource.contents[0].text
+
                   prompts = await client.list_prompts()
                   assert any(item.name == "change_risk_review" for item in prompts.prompts)
+                  prompt = await client.get_prompt(
+                      "change_risk_review", {"service": "payments-api"}
+                  )
+                  assert prompt.messages
 
           asyncio.run(main())
-          print("Real Streamable HTTP MCP smoke passed")
+          print("Real Streamable HTTP MCP full public-surface smoke passed")
           PY
       - name: Docker build
         run: docker build -t mcpbridge-ci .

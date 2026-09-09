@@ -30,9 +30,13 @@ def build_graph():
     """Build the reference LangGraph orchestration path.
 
     Read tools pass straight through the gate and execute. Sensitive writes interrupt the
-    graph, then resume the exact thread after approve/edit/reject. This graph intentionally
-    uses InMemorySaver and is therefore a local/CI reference rather than a claim of durable
-    multi-instance production state.
+    graph, then resume the exact thread only after an explicit synthetic approver decision.
+    The resume payload carries reviewer role/actor metadata so the reference graph exercises
+    the same separation-of-duties boundary as the REST control plane. This is still demo
+    identity, not enterprise SSO/OIDC.
+
+    The graph intentionally uses InMemorySaver and is therefore a local/CI reference rather
+    than a claim of durable multi-instance production state.
     """
 
     def plan(state: AgentState) -> dict[str, Any]:
@@ -60,13 +64,23 @@ def build_graph():
                 "tool": state["tool"],
                 "arguments": state["arguments"],
                 "allowed": ["approve", "edit", "reject"],
+                "required_reviewer_role": Role.APPROVER.value,
             }
         )
-        decision = raw if isinstance(raw, dict) else {"decision": str(raw)}
-        choice = decision.get("decision")
+        if not isinstance(raw, dict):
+            raise TypeError("write review must include decision and reviewer metadata")
+
+        choice = raw.get("decision")
         if choice not in {"approve", "edit", "reject"}:
             raise ValueError("human decision must be approve, edit or reject")
+        if raw.get("reviewer_role") != Role.APPROVER.value:
+            raise PermissionError("only the approver role can review MCP write execution")
+        reviewer_actor = raw.get("reviewer_actor")
+        if not isinstance(reviewer_actor, str) or not reviewer_actor.strip():
+            raise ValueError("reviewer_actor is required for write review")
 
+        decision = dict(raw)
+        decision["reviewer_actor"] = reviewer_actor.strip()
         update: dict[str, Any] = {
             "approval": decision,
             "status": "rejected" if choice == "reject" else "authorized_write",

@@ -29,9 +29,46 @@ async def test_langgraph_interrupt_resume_and_real_mcp_write():
         config=config,
     )
     assert "__interrupt__" in first
-    resumed = await graph.ainvoke(Command(resume={"decision": "approve"}), config=config)
+    resumed = await graph.ainvoke(
+        Command(
+            resume={
+                "decision": "approve",
+                "reviewer_role": "approver",
+                "reviewer_actor": "approver-a",
+            }
+        ),
+        config=config,
+    )
     assert resumed["status"] == "completed"
+    assert resumed["approval"]["reviewer_actor"] == "approver-a"
     assert resumed["result"]["status"] == "created"
+
+
+@pytest.mark.asyncio
+async def test_langgraph_non_approver_cannot_resume_sensitive_write():
+    graph = build_graph()
+    config = {"configurable": {"thread_id": "unauthorized-write-thread"}}
+    first = await graph.ainvoke(
+        {
+            "request": "Create a change request for payments-api",
+            "actor": "operator-a",
+            "role": "operator",
+        },
+        config=config,
+    )
+    assert "__interrupt__" in first
+
+    with pytest.raises(PermissionError, match="only the approver role"):
+        await graph.ainvoke(
+            Command(
+                resume={
+                    "decision": "approve",
+                    "reviewer_role": "operator",
+                    "reviewer_actor": "operator-a",
+                }
+            ),
+            config=config,
+        )
 
 
 @pytest.mark.asyncio
@@ -47,6 +84,15 @@ async def test_langgraph_reject_stops_before_tool_execution():
         config=config,
     )
     assert "__interrupt__" in first
-    resumed = await graph.ainvoke(Command(resume={"decision": "reject"}), config=config)
+    resumed = await graph.ainvoke(
+        Command(
+            resume={
+                "decision": "reject",
+                "reviewer_role": "approver",
+                "reviewer_actor": "approver-b",
+            }
+        ),
+        config=config,
+    )
     assert resumed["status"] == "rejected"
     assert "result" not in resumed

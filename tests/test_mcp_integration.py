@@ -42,15 +42,55 @@ async def test_real_mcp_discovery(builder, expected):
 
 
 @pytest.mark.asyncio
-async def test_real_mcp_tool_resource_and_prompt_round_trip():
-    async with Client(build_itsm_server(), raise_exceptions=True) as client:
-        result = await client.call_tool("get_incident", {"incident_id": "INC-428"})
+@pytest.mark.parametrize(
+    "builder,tool,arguments,resource_uri,resource_marker,prompt,prompt_arguments",
+    [
+        (
+            build_github_server,
+            "get_repository_status",
+            {"repo": "payments-api"},
+            "repo://payments-api",
+            "payments-api",
+            "release_risk_review",
+            {"repo": "payments-api"},
+        ),
+        (
+            build_itsm_server,
+            "get_incident",
+            {"incident_id": "INC-428"},
+            "incident://INC-428",
+            "INC-428",
+            "incident_analysis",
+            {"incident_id": "INC-428"},
+        ),
+        (
+            build_business_server,
+            "get_supplier",
+            {"supplier_id": "SUP-ALPHA"},
+            "supplier://SUP-ALPHA",
+            "SUP-ALPHA",
+            "supplier_comparison",
+            {"left": "SUP-ALPHA", "right": "SUP-BETA"},
+        ),
+    ],
+)
+async def test_each_domain_tool_resource_and_prompt_round_trip(
+    builder,
+    tool,
+    arguments,
+    resource_uri,
+    resource_marker,
+    prompt,
+    prompt_arguments,
+):
+    async with Client(builder(), raise_exceptions=True) as client:
+        result = await client.call_tool(tool, arguments)
         assert result.is_error is False
-        assert result.structured_content["id"] == "INC-428"
+        assert result.structured_content is not None
 
-        resource = await client.read_resource("incident://INC-428")
+        resource = await client.read_resource(resource_uri)
         assert isinstance(resource.contents[0], TextResourceContents)
-        assert "INC-428" in resource.contents[0].text
+        assert resource_marker in resource.contents[0].text
 
-        prompt = await client.get_prompt("incident_analysis", {"incident_id": "INC-428"})
-        assert prompt.messages
+        prompt_result = await client.get_prompt(prompt, prompt_arguments)
+        assert prompt_result.messages

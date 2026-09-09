@@ -12,6 +12,7 @@ from .models import AuditEvent
 _lock = Lock()
 _events: deque[AuditEvent] = deque(maxlen=250)
 _last_hash = "GENESIS"
+_anchor_hash = "GENESIS"
 
 
 def _hash_payload(payload: dict) -> str:
@@ -33,13 +34,18 @@ def append_audit(
     """Append a tamper-evident in-memory audit event.
 
     The lock covers reading the previous hash and writing the new event so concurrent
-    requests cannot fork the in-process chain. Durable cross-instance audit retention is
-    intentionally documented as a production-hardening requirement.
+    requests cannot fork the in-process chain. When the bounded deque rolls over, the hash
+    of the evicted event becomes the retained chain anchor; this keeps integrity checks valid
+    even after more than 250 events. Durable cross-instance audit retention is intentionally
+    documented as a production-hardening requirement.
     """
 
-    global _last_hash
+    global _last_hash, _anchor_hash
     request_hash = _hash_payload(arguments)
     with _lock:
+        if _events.maxlen is not None and len(_events) == _events.maxlen and _events:
+            _anchor_hash = _events[-1].event_hash
+
         base = {
             "event_id": str(uuid4()),
             "timestamp": datetime.now(UTC).isoformat(),
@@ -65,11 +71,16 @@ def list_audit(limit: int = 50) -> list[dict]:
 
 
 def verify_audit_chain() -> bool:
-    """Verify the currently retained in-memory chain from oldest to newest."""
+    """Verify the currently retained in-memory chain from oldest to newest.
+
+    For a chain that has not rolled over, verification starts at ``GENESIS``. Once the
+    bounded buffer evicts older events, verification starts from the saved hash immediately
+    preceding the oldest retained event.
+    """
 
     with _lock:
         ordered = list(reversed(_events))
-    previous = "GENESIS"
+        previous = _anchor_hash
     for event in ordered:
         if event.previous_hash != previous:
             return False
@@ -92,7 +103,8 @@ def verify_audit_chain() -> bool:
 
 
 def reset_audit_for_tests() -> None:
-    global _last_hash
+    global _last_hash, _anchor_hash
     with _lock:
         _events.clear()
         _last_hash = "GENESIS"
+        _anchor_hash = "GENESIS"
