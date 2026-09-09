@@ -32,5 +32,53 @@ jobs:
         run: pytest
       - name: Combined ASGI import smoke
         run: python -c "from app import app; print(app.title)"
+      - name: Real Streamable HTTP MCP end-to-end
+        env:
+          MCPBRIDGE_APPROVAL_SECRET: ci-secret-not-production
+        run: |
+          uvicorn app:app --host 127.0.0.1 --port 8765 > /tmp/mcpbridge-uvicorn.log 2>&1 &
+          SERVER_PID=$!
+          trap 'kill $SERVER_PID 2>/dev/null || true; cat /tmp/mcpbridge-uvicorn.log' EXIT
+          python - <<'PY'
+          import asyncio
+          import json
+          import time
+          import urllib.request
+          from mcp import Client
+
+          BASE = "http://127.0.0.1:8765"
+          for _ in range(40):
+              try:
+                  with urllib.request.urlopen(BASE + "/gateway/health", timeout=1) as response:
+                      health = json.load(response)
+                  if health.get("ok"):
+                      break
+              except Exception:
+                  time.sleep(0.25)
+          else:
+              raise RuntimeError("MCPBridge HTTP server did not become ready")
+
+          async def main():
+              async with Client(BASE + "/mcp/", raise_exceptions=True) as client:
+                  tools = await client.list_tools()
+                  names = {tool.name for tool in tools.tools}
+                  assert {"get_incident", "get_repository_status", "compare_suppliers"}.issubset(names)
+                  assert "create_change_request" not in names
+                  assert "create_github_issue" not in names
+                  assert str(client.protocol_version) == "2026-07-28"
+
+                  result = await client.call_tool("get_incident", {"incident_id": "INC-428"})
+                  assert result.is_error is False
+                  assert result.structured_content is not None
+                  assert result.structured_content["id"] == "INC-428"
+
+                  resources = await client.list_resource_templates()
+                  assert any(item.uri_template == "incident://{incident_id}" for item in resources.resource_templates)
+                  prompts = await client.list_prompts()
+                  assert any(item.name == "change_risk_review" for item in prompts.prompts)
+
+          asyncio.run(main())
+          print("Real Streamable HTTP MCP smoke passed")
+          PY
       - name: Docker build
         run: docker build -t mcpbridge-ci .
