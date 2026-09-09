@@ -1,0 +1,8 @@
+services:
+  gateway:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      MCPBRIDGE_ENV: development
+      MCPBRIDGE_APPROVAL_SECRET: local-compose-secret
