@@ -19,8 +19,26 @@ MAX_BODY_BYTES = 64 * 1024
 
 @app.middleware("http")
 async def request_size_guard(request: Request, call_next):
+    """Enforce the request-size boundary for declared and actual payload sizes.
+
+    Content-Length is an optimization, not a trust boundary: clients may omit it (for example,
+    with chunked transfer encoding). We therefore validate the header when present and also
+    inspect the actual buffered request body before routing.
+    """
+
     value = request.headers.get("content-length")
-    if value and int(value) > MAX_BODY_BYTES:
+    if value:
+        try:
+            declared_size = int(value)
+        except ValueError:
+            return JSONResponse({"detail": "invalid content-length"}, status_code=400)
+        if declared_size < 0:
+            return JSONResponse({"detail": "invalid content-length"}, status_code=400)
+        if declared_size > MAX_BODY_BYTES:
+            return JSONResponse({"detail": "request body too large"}, status_code=413)
+
+    body = await request.body()
+    if len(body) > MAX_BODY_BYTES:
         return JSONResponse({"detail": "request body too large"}, status_code=413)
     return await call_next(request)
 
