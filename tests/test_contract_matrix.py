@@ -3,7 +3,6 @@ import pytest
 from src.mcpbridge.gateway import decide, execute
 from src.mcpbridge.models import Role
 
-
 READ_CASES = [
     ("github", "search_repository", {"query": "payment"}),
     ("github", "get_repository_status", {"repo": "payments-api"}),
