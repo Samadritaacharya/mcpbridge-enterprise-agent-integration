@@ -68,7 +68,7 @@ def build_graph():
             }
         )
         if not isinstance(raw, dict):
-            raise ValueError("write review must include decision and reviewer metadata")
+            raise TypeError("write review must include decision and reviewer metadata")
 
         choice = raw.get("decision")
         if choice not in {"approve", "edit", "reject"}:
