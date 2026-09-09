@@ -1,5 +1,4 @@
 import pytest
-
 from src.mcpbridge.gateway import decide, execute
 from src.mcpbridge.models import Role
 
