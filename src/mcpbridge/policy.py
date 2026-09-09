@@ -10,7 +10,6 @@ from typing import Any
 
 from .models import Effect, Role, ToolPolicy
 
-
 POLICIES: dict[tuple[str, str], ToolPolicy] = {}
 
 
