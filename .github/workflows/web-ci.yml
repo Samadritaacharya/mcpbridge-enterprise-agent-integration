@@ -13,7 +13,7 @@ jobs:
   verify:
     name: Web verification
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: frontend
@@ -22,8 +22,15 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: Install
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+      - name: Install web
         run: npm install
+      - name: Install Python backend for connected E2E
+        working-directory: .
+        run: pip install -e .
       - name: Typecheck
         run: npm run typecheck
       - name: Unit tests
@@ -113,5 +120,109 @@ jobs:
             throw new Error('web approval execution smoke failed');
           }
 
-          console.log('Next.js production end-to-end smoke passed');
+          console.log('Next.js deterministic production end-to-end smoke passed');
+          JS
+      - name: Connected Python + Next.js end-to-end smoke
+        env:
+          MCPBRIDGE_APPROVAL_SECRET: ci-secret-not-production
+          MCPBRIDGE_API_URL: http://127.0.0.1:8765/gateway
+        run: |
+          cd ..
+          uvicorn app:app --host 127.0.0.1 --port 8765 > /tmp/mcpbridge-python.log 2>&1 &
+          PYTHON_PID=$!
+          cd frontend
+          npm start -- --hostname 127.0.0.1 --port 3001 > /tmp/mcpbridge-connected-web.log 2>&1 &
+          WEB_PID=$!
+          cleanup() {
+            kill $WEB_PID 2>/dev/null || true
+            kill $PYTHON_PID 2>/dev/null || true
+            cat /tmp/mcpbridge-connected-web.log
+            cat /tmp/mcpbridge-python.log
+          }
+          trap cleanup EXIT
+          node - <<'JS'
+          const web = 'http://127.0.0.1:3001';
+          const backend = 'http://127.0.0.1:8765';
+          const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+          async function waitFor(url, label) {
+            for (let attempt = 0; attempt < 60; attempt++) {
+              try {
+                const response = await fetch(url);
+                if (response.ok) return;
+              } catch {}
+              if (attempt === 59) throw new Error(`${label} did not become ready`);
+              await sleep(250);
+            }
+          }
+
+          async function json(path, init) {
+            const response = await fetch(web + path, init);
+            const body = await response.json();
+            if (!response.ok) throw new Error(`${path} failed (${response.status}): ${JSON.stringify(body)}`);
+            return {response, body};
+          }
+
+          await waitFor(backend + '/gateway/health', 'Python gateway');
+          await waitFor(web + '/api/health', 'connected Next.js server');
+
+          const health = await json('/api/health');
+          if (health.body.runtime_mode !== 'connected-python-mcp' || health.body.backend_configured !== true) {
+            throw new Error(`connected runtime mode mismatch: ${JSON.stringify(health.body)}`);
+          }
+
+          const catalog = await json('/api/catalog');
+          const serverNames = Object.keys(catalog.body.servers || {}).sort();
+          if (serverNames.join(',') !== 'business,github,itsm') throw new Error('connected catalog mismatch');
+
+          const agent = await json('/api/agent', {
+            method: 'POST',
+            headers: {'content-type': 'application/json'},
+            body: JSON.stringify({
+              role: 'operator',
+              request: 'Show me incident INC-428 and its current status.',
+            }),
+          });
+          if (agent.body.status !== 'completed' || agent.body.plan?.tool !== 'get_incident' || agent.body.result?.id !== 'INC-428') {
+            throw new Error(`connected agent read failed: ${JSON.stringify(agent.body)}`);
+          }
+
+          const proposal = await json('/api/execute', {
+            method: 'POST',
+            headers: {'content-type': 'application/json'},
+            body: JSON.stringify({
+              role: 'operator',
+              server: 'itsm',
+              tool: 'create_change_request',
+              arguments: {
+                service: 'payments-api',
+                summary: 'Connected full-stack deployment-readiness smoke',
+                risk: 'low',
+                implementation_window: 'approved test window',
+              },
+            }),
+          });
+          if (proposal.body.status !== 'approval_required' || !proposal.body.approval_token) {
+            throw new Error(`connected proposal failed: ${JSON.stringify(proposal.body)}`);
+          }
+
+          const approved = await json('/api/approve', {
+            method: 'POST',
+            headers: {'content-type': 'application/json'},
+            body: JSON.stringify({
+              role: 'approver',
+              approval_token: proposal.body.approval_token,
+              decision: 'approve',
+            }),
+          });
+          if (approved.body.status !== 'completed' || approved.body.result?.status !== 'created' || approved.body.result?.synthetic !== true) {
+            throw new Error(`connected approval failed: ${JSON.stringify(approved.body)}`);
+          }
+
+          const audit = await json('/api/audit');
+          if (audit.body.chain_valid !== true || !Array.isArray(audit.body.events) || audit.body.events.length < 3) {
+            throw new Error(`connected audit verification failed: ${JSON.stringify(audit.body)}`);
+          }
+
+          console.log('Next.js -> Python gateway -> MCP connected full-stack smoke passed');
           JS
