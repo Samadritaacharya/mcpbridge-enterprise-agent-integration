@@ -10,6 +10,20 @@ from .policy import authorize, mint_approval_token, verify_approval_token
 from .servers import build_servers
 
 
+def _application_data(structured: Any) -> Any:
+    """Normalize SDK wrappers while preserving real structured tool objects.
+
+    MCP v2 wraps primitive/list structured outputs as ``{"result": ...}`` because the
+    generated output schema must be an object. Dict-shaped tool results are already returned
+    as their application object. MCPBridge unwraps only the single-key SDK wrapper so the
+    gateway contract stays natural for both shapes.
+    """
+
+    if isinstance(structured, dict) and set(structured) == {"result"}:
+        return structured["result"]
+    return structured
+
+
 async def call_mcp_tool(server: str, tool: str, arguments: dict[str, Any]) -> Any:
     """Execute a call through the official MCP Client protocol layer."""
 
@@ -20,9 +34,11 @@ async def call_mcp_tool(server: str, tool: str, arguments: dict[str, Any]) -> An
         result = await client.call_tool(tool, arguments)
         if result.is_error:
             raise RuntimeError(f"MCP tool returned an error: {server}.{tool}")
-        if result.structured_content is not None:
-            return result.structured_content
-        return [getattr(block, "text", str(block)) for block in result.content]
+        if result.structured_content is None:
+            raise RuntimeError(
+                f"MCP tool did not return structured application data: {server}.{tool}"
+            )
+        return _application_data(result.structured_content)
 
 
 async def execute(
