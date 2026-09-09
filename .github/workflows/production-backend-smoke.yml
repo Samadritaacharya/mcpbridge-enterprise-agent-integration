@@ -1,0 +1,246 @@
+name: Production Backend Smoke
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-backend-smoke-main
+  cancel-in-progress: true
+
+jobs:
+  verify-live-backend:
+    name: Production backend smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      BASE_URL: https://mcpbridge-enterprise-agent-integrat-seven.vercel.app
+      EXPECTED_SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+      - name: Install MCP client
+        run: pip install -e .
+      - name: Wait for matching Vercel deployment and verify production backend
+        run: |
+          python - <<'PY'
+          import asyncio
+          import json
+          import os
+          import time
+          import urllib.error
+          import urllib.request
+          from mcp import Client
+          from mcp.types import TextResourceContents
+
+          BASE = os.environ['BASE_URL'].rstrip('/')
+          EXPECTED_SHA = os.environ['EXPECTED_SHA']
+
+          def request_json(path, *, method='GET', payload=None, headers=None, expected=(200,)):
+              data = None if payload is None else json.dumps(payload).encode()
+              request_headers = {'accept': 'application/json'}
+              if payload is not None:
+                  request_headers['content-type'] = 'application/json'
+              if headers:
+                  request_headers.update(headers)
+              req = urllib.request.Request(
+                  BASE + path,
+                  data=data,
+                  headers=request_headers,
+                  method=method,
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=20) as response:
+                      status = response.status
+                      raw = response.read().decode()
+              except urllib.error.HTTPError as exc:
+                  status = exc.code
+                  raw = exc.read().decode()
+              try:
+                  body = json.loads(raw) if raw else None
+              except json.JSONDecodeError as exc:
+                  raise AssertionError(f'{path} returned non-JSON status={status}: {raw[:500]}') from exc
+              if status not in expected:
+                  raise AssertionError(f'{path} expected {expected}, got {status}: {body}')
+              return status, body
+
+          # Vercel may still be promoting the commit when this workflow starts. Poll until
+          # the public alias serves the exact Git SHA that triggered this workflow.
+          for attempt in range(90):
+              try:
+                  _, health = request_json('/gateway/health')
+                  deployment_sha = health.get('deployment_sha')
+                  if health.get('ok') is True and deployment_sha == EXPECTED_SHA:
+                      break
+                  print(f'Waiting for Vercel SHA {EXPECTED_SHA[:12]} (currently {deployment_sha})')
+              except Exception as exc:
+                  print(f'Waiting for public backend: {exc}')
+              if attempt == 89:
+                  raise RuntimeError('Vercel production alias did not serve the expected Git SHA in time')
+              time.sleep(5)
+
+          _, root = request_json('/')
+          assert root['service'] == 'mcpbridge'
+          assert root['protocol_target'] == '2026-07-28'
+
+          _, health = request_json('/gateway/health')
+          assert health['ok'] is True
+          assert health['service'] == 'mcpbridge'
+          assert health['protocol_target'] == '2026-07-28'
+          assert health['transport'] == 'streamable-http'
+          assert health['deployment_sha'] == EXPECTED_SHA
+
+          _, catalog = request_json('/gateway/v1/catalog')
+          assert set(catalog['servers']) == {'github', 'itsm', 'business'}
+
+          # Automatic read through policy -> official MCP client -> synthetic ITSM MCP tool.
+          _, read = request_json(
+              '/gateway/v1/execute',
+              method='POST',
+              headers={'x-demo-actor': 'production-smoke-viewer', 'x-demo-role': 'viewer'},
+              payload={
+                  'server': 'itsm',
+                  'tool': 'get_incident',
+                  'arguments': {'incident_id': 'INC-428'},
+              },
+          )
+          assert read['status'] == 'completed'
+          assert read['result']['id'] == 'INC-428'
+
+          write_payload = {
+              'server': 'itsm',
+              'tool': 'create_change_request',
+              'arguments': {
+                  'service': 'payments-api',
+                  'summary': 'Vercel production smoke',
+                  'risk': 'low',
+                  'implementation_window': 'synthetic test window',
+              },
+          }
+
+          # Viewer cannot propose writes.
+          status, denied = request_json(
+              '/gateway/v1/execute',
+              method='POST',
+              headers={'x-demo-actor': 'production-smoke-viewer', 'x-demo-role': 'viewer'},
+              payload=write_payload,
+              expected=(403,),
+          )
+          assert status == 403
+          assert 'permission' in json.dumps(denied).lower() or 'not allowed' in json.dumps(denied).lower()
+
+          # Operator can propose but not execute a write.
+          _, proposal = request_json(
+              '/gateway/v1/execute',
+              method='POST',
+              headers={'x-demo-actor': 'production-smoke-operator', 'x-demo-role': 'operator'},
+              payload=write_payload,
+          )
+          assert proposal['status'] == 'approval_required'
+          token = proposal['approval_token']
+
+          # Tampering with the signed proposal must fail.
+          tampered = token[:-1] + ('A' if token[-1] != 'A' else 'B')
+          tamper_status, _ = request_json(
+              '/gateway/v1/approve',
+              method='POST',
+              headers={'x-demo-actor': 'production-smoke-approver', 'x-demo-role': 'approver'},
+              payload={'approval_token': tampered, 'decision': 'approve'},
+              expected=(422,),
+          )
+          assert tamper_status == 422
+
+          # Approve the original proposal.
+          _, approved = request_json(
+              '/gateway/v1/approve',
+              method='POST',
+              headers={'x-demo-actor': 'production-smoke-approver', 'x-demo-role': 'approver'},
+              payload={'approval_token': token, 'decision': 'approve'},
+          )
+          assert approved['status'] == 'completed'
+          assert approved['decision'] == 'approve'
+          assert approved['result']['status'] == 'created'
+          assert approved['result']['synthetic'] is True
+
+          # Edit before execution.
+          _, edit_proposal = request_json(
+              '/gateway/v1/execute',
+              method='POST',
+              headers={'x-demo-actor': 'production-smoke-operator', 'x-demo-role': 'operator'},
+              payload=write_payload,
+          )
+          edited_arguments = dict(write_payload['arguments'])
+          edited_arguments['summary'] = 'Human-edited Vercel production smoke'
+          _, edited = request_json(
+              '/gateway/v1/approve',
+              method='POST',
+              headers={'x-demo-actor': 'production-smoke-approver', 'x-demo-role': 'approver'},
+              payload={
+                  'approval_token': edit_proposal['approval_token'],
+                  'decision': 'edit',
+                  'edited_arguments': edited_arguments,
+              },
+          )
+          assert edited['status'] == 'completed'
+          assert edited['decision'] == 'edit'
+          assert edited['arguments']['summary'] == 'Human-edited Vercel production smoke'
+
+          # Reject without executing.
+          _, reject_proposal = request_json(
+              '/gateway/v1/execute',
+              method='POST',
+              headers={'x-demo-actor': 'production-smoke-operator', 'x-demo-role': 'operator'},
+              payload=write_payload,
+          )
+          _, rejected = request_json(
+              '/gateway/v1/approve',
+              method='POST',
+              headers={'x-demo-actor': 'production-smoke-approver', 'x-demo-role': 'approver'},
+              payload={'approval_token': reject_proposal['approval_token'], 'decision': 'reject'},
+          )
+          assert rejected['status'] == 'rejected'
+
+          _, audit = request_json('/gateway/v1/audit')
+          assert audit['chain_valid'] is True
+          assert audit['persistence'] == 'in-memory-demo'
+
+          async def verify_public_mcp():
+              async with Client(BASE + '/mcp/', raise_exceptions=True) as client:
+                  assert str(client.protocol_version) == '2026-07-28'
+                  tools = await client.list_tools()
+                  names = {tool.name for tool in tools.tools}
+                  assert {'get_incident', 'get_repository_status', 'compare_suppliers'}.issubset(names)
+                  assert {'create_incident', 'create_change_request', 'create_github_issue'}.isdisjoint(names)
+
+                  incident = await client.call_tool('get_incident', {'incident_id': 'INC-428'})
+                  assert incident.is_error is False
+                  assert incident.structured_content['id'] == 'INC-428'
+
+                  repository = await client.call_tool('get_repository_status', {'repo': 'payments-api'})
+                  assert repository.structured_content['name'] == 'payments-api'
+
+                  comparison = await client.call_tool(
+                      'compare_suppliers', {'left': 'SUP-ALPHA', 'right': 'SUP-BETA'}
+                  )
+                  assert comparison.structured_content['left']['id'] == 'SUP-ALPHA'
+                  assert comparison.structured_content['right']['id'] == 'SUP-BETA'
+
+                  resources = await client.list_resource_templates()
+                  assert any(r.uri_template == 'incident://{incident_id}' for r in resources.resource_templates)
+                  resource = await client.read_resource('incident://INC-428')
+                  assert isinstance(resource.contents[0], TextResourceContents)
+                  assert 'INC-428' in resource.contents[0].text
+
+                  prompts = await client.list_prompts()
+                  assert any(p.name == 'change_risk_review' for p in prompts.prompts)
+
+          asyncio.run(verify_public_mcp())
+          print(f'Production MCPBridge backend smoke passed: {BASE} @ {EXPECTED_SHA}')
+          PY
