@@ -1,11 +1,12 @@
 import pytest
+import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
 from src.mcpbridge.api import app
 from src.mcpbridge.audit import reset_audit_for_tests
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def client():
     reset_audit_for_tests()
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as http:
