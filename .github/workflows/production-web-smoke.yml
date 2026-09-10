@@ -29,8 +29,8 @@ jobs:
           node-version: '22'
       - name: Verify deployed Next.js command center end to end
         run: |
-          node - <<'JS'
-          const assert = require('node:assert/strict');
+          node --input-type=module - <<'JS'
+          import assert from 'node:assert/strict';
           const BASE = process.env.BASE_URL.replace(/\/$/, '');
           const EXPECTED_SHA = process.env.EXPECTED_SHA;
           const REQUIRE_MATCHING_SHA = process.env.EVENT_NAME === 'push';
