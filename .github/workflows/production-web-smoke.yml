@@ -1,0 +1,222 @@
+name: Production Web Smoke
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-web-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify-live-web:
+    name: Production web smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      BASE_URL: https://mcpbridge-enterprise-agent-integrat-seven.vercel.app
+      EXPECTED_SHA: ${{ github.sha }}
+      EVENT_NAME: ${{ github.event_name }}
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Verify deployed Next.js command center end to end
+        run: |
+          node - <<'JS'
+          const assert = require('node:assert/strict');
+          const BASE = process.env.BASE_URL.replace(/\/$/, '');
+          const EXPECTED_SHA = process.env.EXPECTED_SHA;
+          const REQUIRE_MATCHING_SHA = process.env.EVENT_NAME === 'push';
+          const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+          async function request(path, init = {}, expected = [200]) {
+            const response = await fetch(BASE + path, {
+              redirect: 'follow',
+              ...init,
+              headers: {
+                accept: 'application/json',
+                ...(init.body ? {'content-type': 'application/json'} : {}),
+                ...(init.headers || {}),
+              },
+            });
+            const text = await response.text();
+            let body = text;
+            const contentType = response.headers.get('content-type') || '';
+            if (contentType.includes('application/json')) {
+              try { body = text ? JSON.parse(text) : null; }
+              catch { throw new Error(`${path} returned malformed JSON: ${text.slice(0, 500)}`); }
+            }
+            assert.ok(expected.includes(response.status), `${path}: expected ${expected.join('/')}, got ${response.status}: ${text.slice(0, 500)}`);
+            return {response, body, text};
+          }
+
+          async function waitForDeployment() {
+            const attempts = REQUIRE_MATCHING_SHA ? 120 : 30;
+            for (let attempt = 0; attempt < attempts; attempt++) {
+              try {
+                const {body} = await request('/api/health');
+                if (body?.ok === true) {
+                  if (!REQUIRE_MATCHING_SHA || body.deployment_sha === EXPECTED_SHA) {
+                    console.log(`Live deployment ready: mode=${body.runtime_mode} sha=${body.deployment_sha}`);
+                    return body;
+                  }
+                  console.log(`Waiting for Vercel SHA ${EXPECTED_SHA.slice(0, 12)}; current=${body.deployment_sha}`);
+                }
+              } catch (error) {
+                console.log(`Waiting for live app: ${error.message}`);
+              }
+              await sleep(5000);
+            }
+            throw new Error(REQUIRE_MATCHING_SHA
+              ? `Production alias did not serve expected SHA ${EXPECTED_SHA}`
+              : 'Production app did not become healthy');
+          }
+
+          const health = await waitForDeployment();
+          assert.equal(health.service, 'mcpbridge-web');
+          assert.equal(health.protocol_target, '2026-07-28');
+          assert.equal(health.paid_api_required, false);
+          assert.ok(['deterministic-public-demo', 'connected-python-mcp'].includes(health.runtime_mode));
+          assert.equal(health.backend_configured, health.runtime_mode === 'connected-python-mcp');
+
+          const root = await fetch(BASE + '/', {redirect: 'follow'});
+          const html = await root.text();
+          assert.equal(root.status, 200);
+          assert.match(html, /MCPBridge/i);
+          assert.match(html, /human|approval|govern/i);
+
+          const {body: catalog} = await request('/api/catalog');
+          assert.deepEqual(Object.keys(catalog.servers || {}).sort(), ['business', 'github', 'itsm']);
+          assert.equal(catalog.protocol_target, '2026-07-28');
+
+          const {response: agentResponse, body: agent} = await request('/api/agent', {
+            method: 'POST',
+            body: JSON.stringify({role: 'viewer', request: 'Show me incident INC-428 and its current status.'}),
+          });
+          assert.equal(agentResponse.headers.get('x-mcpbridge-mode'), health.runtime_mode);
+          assert.equal(agent.status, 'completed');
+          assert.equal(agent.plan?.tool, 'get_incident');
+          assert.equal(agent.result?.id, 'INC-428');
+
+          const readPayload = {
+            role: 'viewer',
+            server: 'itsm',
+            tool: 'get_incident',
+            arguments: {incident_id: 'INC-428'},
+          };
+          const {response: readResponse, body: read} = await request('/api/execute', {
+            method: 'POST',
+            body: JSON.stringify(readPayload),
+          });
+          assert.equal(readResponse.headers.get('x-mcpbridge-mode'), health.runtime_mode);
+          assert.equal(read.status, 'completed');
+          assert.equal(read.result?.id, 'INC-428');
+
+          const writePayload = {
+            role: 'operator',
+            server: 'itsm',
+            tool: 'create_change_request',
+            arguments: {
+              service: 'payments-api',
+              summary: 'External production smoke',
+              risk: 'low',
+              implementation_window: 'synthetic test window',
+            },
+          };
+
+          const {body: denied} = await request('/api/execute', {
+            method: 'POST',
+            body: JSON.stringify({...writePayload, role: 'viewer'}),
+          }, [403]);
+          assert.match(String(denied.error || denied.detail || ''), /role|permission|allow/i);
+
+          const {body: proposal} = await request('/api/execute', {
+            method: 'POST',
+            body: JSON.stringify(writePayload),
+          });
+          assert.equal(proposal.status, 'approval_required');
+          assert.equal(proposal.effect, 'write');
+          assert.ok(typeof proposal.approval_token === 'string' && proposal.approval_token.length > 20);
+
+          const token = proposal.approval_token;
+          const tampered = token.slice(0, -1) + (token.endsWith('A') ? 'B' : 'A');
+          const {body: tamper} = await request('/api/approve', {
+            method: 'POST',
+            body: JSON.stringify({role: 'approver', approval_token: tampered, decision: 'approve'}),
+          }, [403]);
+          assert.match(String(tamper.error || tamper.detail || ''), /invalid|signature|token/i);
+
+          const {response: approveResponse, body: approved} = await request('/api/approve', {
+            method: 'POST',
+            body: JSON.stringify({role: 'approver', approval_token: token, decision: 'approve'}),
+          });
+          assert.equal(approveResponse.headers.get('x-mcpbridge-mode'), health.runtime_mode);
+          assert.equal(approved.status, 'completed');
+          assert.equal(approved.result?.status, 'created');
+          assert.equal(approved.result?.synthetic, true);
+
+          const {body: editProposal} = await request('/api/execute', {
+            method: 'POST',
+            body: JSON.stringify(writePayload),
+          });
+          const editedArgs = {...writePayload.arguments, summary: 'Human-edited external production smoke'};
+          const {body: edited} = await request('/api/approve', {
+            method: 'POST',
+            body: JSON.stringify({
+              role: 'approver',
+              approval_token: editProposal.approval_token,
+              decision: 'edit',
+              edited_arguments: editedArgs,
+            }),
+          });
+          assert.equal(edited.status, 'completed');
+          assert.equal(edited.arguments?.summary, editedArgs.summary);
+          assert.equal(edited.result?.synthetic, true);
+
+          const {body: rejectProposal} = await request('/api/execute', {
+            method: 'POST',
+            body: JSON.stringify(writePayload),
+          });
+          const {body: rejected} = await request('/api/approve', {
+            method: 'POST',
+            body: JSON.stringify({role: 'approver', approval_token: rejectProposal.approval_token, decision: 'reject'}),
+          });
+          assert.equal(rejected.status, 'rejected');
+
+          const {body: audit} = await request('/api/audit');
+          if (health.runtime_mode === 'connected-python-mcp') {
+            assert.equal(audit.chain_valid, true);
+            assert.ok(Array.isArray(audit.events));
+          } else {
+            assert.ok(Array.isArray(audit.events));
+            assert.match(String(audit.note || ''), /browser|session|fallback/i);
+          }
+
+          await request('/api/agent', {
+            method: 'POST',
+            body: JSON.stringify({role: 'viewer', request: 'show incident', unexpected: true}),
+          }, [422]);
+
+          const malformed = await fetch(BASE + '/api/agent', {
+            method: 'POST',
+            headers: {'content-type': 'application/json'},
+            body: '{bad json',
+          });
+          assert.equal(malformed.status, 400);
+
+          const oversized = await fetch(BASE + '/api/agent', {
+            method: 'POST',
+            headers: {'content-type': 'application/json'},
+            body: JSON.stringify({role: 'viewer', request: 'x'.repeat(70 * 1024)}),
+          });
+          assert.equal(oversized.status, 413);
+
+          console.log(`Production MCPBridge web smoke passed: ${BASE} mode=${health.runtime_mode}`);
+          JS
